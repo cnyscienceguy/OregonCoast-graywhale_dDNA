@@ -1,0 +1,1341 @@
+---
+title: "DNA metabarcoding reveals prey diversity and structure in the diet of gray whales, ver. November 2, 2026"
+author: "Charles Nye et al. 2026"
+format: html
+editor: visual
+editor_options: 
+  chunk_output_type: console
+---
+
+This script is the primary analysis for an academic manuscript: "DNA metabarcoding reveals prey diversity and structure in the diet of gray whales."
+
+Authors for this paper:
+
+- Charles Nye*
+- Leigh Torres
+- Alejandro Fernandez Ajo
+- Natalie Chazal
+- Lisa Hildebrand
+- Hali Peterson
+- Sarah Henkel
+- Debbie Steel
+- C. Scott Baker
+
+Charles Nye is the corresponding author: charles.nye@oregonstate.edu
+
+In order to properly run this script, curated raw data inputs from Dryad repository (X) are required. This .qmd file assumes the data inputs reside within a sister directory (titled "00_data-inputs").
+
+```{r Setup}
+#| echo: false
+# Set seed #
+set.seed(120396)
+# This function just clears everything out, for those who come after #
+gommage = function() {
+  gctorture(TRUE)
+  rm(list = ls(all.names = TRUE, envir = sys.frame(-1)),
+     envir = sys.frame(-1))
+  while (dev.cur() > 1) {
+    dev.off()
+  }
+  gctorture(FALSE)
+}
+
+# Import packages #
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(
+  ANCOMBC, data.table, factoextra, ggpubr, ggrepel, ggtext, ggvenn, glue, indicspecies,
+  kableExtra, knitr, pacman, tidyverse, vegan, viridis, webshot2, scales, patchwork, gt,
+  cluster, fpc, corrplot, FSAmisc, hexbin, sf, marmap, rnaturalearth, ggspatial, ggnewscale,
+  shadowtext
+)
+# Warning: some of these packages are from bioconductor and, therefore, may require some additional TLC to get installed and working. #
+```
+
+```{r Import data}
+#| echo: false
+read.data = function(x) {
+  read.csv(paste0("../00_data-inputs/", x, ".csv"), row.names = 1, header = TRUE)
+}
+
+read.data("read_table") -> raw.reads # Read table #
+read.data("blast_table") -> blast # BLAST outputs #
+read.data("taxonomy_table") -> taxonomy # Taxonomy table #
+read.data("metadata") -> metadata # Metadata table #
+
+# Specific metadata subsets #
+sample.metadata = metadata %>% filter(type == "dDNA_E.robustus")
+control.metadata = metadata %>% filter(type != "dDNA_E.robustus")
+# Sample lists #
+metadata %>% filter(type == "dDNA_E.robustus") %>% pull(sample) %>% unique() -> gw.dDNA.samples
+```
+
+## DUPLICATES
+
+```{r Take the average, keep only 1}
+#| echo: false
+# Handle duplicates #
+metadata %>% distinct(sample, full_id) %>%
+  group_by(full_id) %>%
+  mutate(reps = n_distinct(sample)) %>% ungroup() %>%
+  filter(reps > 1) %>%
+  pull(sample) %>% c() -> dups
+dups # These are the samples
+metadata %>% distinct(sample, full_id) %>%
+  group_by(full_id) %>%
+  mutate(reps = n_distinct(sample)) %>% ungroup() %>%
+  filter(reps > 1) %>% distinct(sample, full_id) %>%
+  group_by(full_id) %>% slice_head(n = 1) %>% ungroup() -> dup.meta
+
+raw.reads %>% filter(sample %in% dups) %>%
+  left_join(., (metadata %>% distinct(sample, full_id)), by = "sample") %>%
+  group_by(full_id, ASV_ID) %>%
+  summarise(RA = mean(RA)) %>% ungroup() %>% mutate(RA = floor(RA)) %>%
+  left_join(., (raw.reads %>% dplyr::select(ASV_ID, MOTU) %>% unique()),
+             by = "ASV_ID") -> dup.reads
+dup.reads %>% left_join(., dup.meta, by = "full_id") %>%
+  dplyr::select(sample, everything()) %>% dplyr::select(-full_id) -> dup.reads
+
+raw.reads %>% filter(!sample %in% dups) -> reads
+rbind(raw.reads, dup.reads) %>% arrange(sample) -> raw.reads
+
+metadata %>% filter(sample %in% raw.reads$sample) -> metadata
+
+# Tidy up #
+remove(dups)
+remove(dup.meta)
+remove(dup.reads)
+```
+
+## SEQ OUTPUT & ASV CONVERSION TO MOTUS
+
+```{r Read QC}
+
+#### Descriptive components ####
+# Initial n #
+raw.reads %>% filter(sample %in% gw.dDNA.samples) %>%
+  pull(sample) %>% unique() %>% length() -> initial.n
+initial.n
+
+# Pre-QC read abundance (total) #
+raw.reads$RA %>% sum() %>% comma() -> preQC.RA
+preQC.RA
+
+# Pre-QC read abundance (mean) #
+raw.reads %>% group_by(sample) %>% summarise(RA = sum(RA)) %>%
+  ungroup() %>% pull(RA) %>% mean() %>% signif(digits = 3) %>%
+  comma() -> preQC.mean.RA
+preQC.mean.RA
+
+# Pre-QC ASV richness #
+(length(unique(raw.reads$ASV_ID))+183) %>% comma() -> preQC.ASV.S # Add 183 that had no matches
+preQC.ASV.S
+
+# Gray whale ASVs #
+taxonomy %>% filter(family == "Eschrichtiidae") %>% pull(ASV_ID) %>%
+  unique() -> gw.ASVs
+gw.ASVs %>% length()
+
+# Mean GW ASV RA (per-sample) #
+raw.reads %>% filter(ASV_ID %in% gw.ASVs) %>% group_by(sample) %>%
+  summarise(RA = mean(RA)) %>% ungroup() %>% pull(RA) %>% mean() %>%
+  comma() -> gw.ASV.RA.mean
+gw.ASV.RA.mean
+
+# Mean GW ASV RA (total) #
+raw.reads %>% filter(ASV_ID %in% gw.ASVs) %>% pull(RA) %>% sum() %>%
+  comma() -> gw.ASV.RA.total
+gw.ASV.RA.total
+
+# Percentage #
+((raw.reads %>% filter(ASV_ID %in% gw.ASVs) %>% pull(RA) %>% sum())/sum(raw.reads$RA)*100) %>% signif(digits = 3) -> gw.ASV.RA.percentage
+gw.ASV.RA.percentage
+
+#### QC ####
+# Select gray whale dDNA samples #
+raw.reads %>% filter(sample %in% gw.dDNA.samples) -> reads
+#### Filter gray whale reads ####
+reads %>% filter(!ASV_ID %in% gw.ASVs) -> reads
+#### Remove samples under QC threshold ####
+blast %>% filter(percent_identity >= 85.0 | bit_score >= 250.0) %>%
+  pull(ASV_ID) %>% unique() -> quality.ASVs
+blast %>% filter(percent_identity < 85.0 | bit_score < 250.0) %>%
+  unique() -> ASVs.below.threshold
+reads %>% filter(ASV_ID %in% quality.ASVs) -> reads
+#### Contaminants ####
+taxonomy %>% filter(kingdom == "Fungi" | # Not mushroom to discuss
+                 kingdom == "Bacteria" | # 5 second rule, much?
+                 kingdom == "Bacillati" | # I'd hate to be a microbiome researcher; how many taxa are there???
+                 kingdom == "Heunggongvirae" | # Are viruses life?
+                 kingdom == "Pseudomonadati" | # Pseudo-what-i?
+                 class == "Insecta" | # This bugs me.
+                 class == "Hexapoda" | # Ditto.
+                 class == "Protura" | # Trio.
+                 class == "Arachnida" | # I like spiders, though.
+                 MOTU == "Channa gachua" | # Weird freshwater fish.
+                 class == "Mammalia" | # With apologies to my beloved pets, but I don't want dog or cat DNA in here.
+                 order == "Primates" |
+                 species == "Bacteriophage sp.") -> contaminant.ASVs 
+reads %>% filter(!ASV_ID %in% contaminant.ASVs$ASV_ID) -> reads
+#### Remove singletons ####
+reads %>% group_by(ASV_ID) %>% summarise(RA = sum(RA)) %>%
+  filter(RA <= 1) %>% pull(ASV_ID) %>% unique() -> singleton.ASVs
+reads %>% filter(!ASV_ID %in% singleton.ASVs) -> reads
+# Remove useless MOTUs #
+reads %>% filter(MOTU != "uncultured diatom" &
+              MOTU != "uncultured dinoflagellate" &
+              MOTU != "uncultured Kareniaceae" &
+              MOTU != "invertebrate environmental sample") -> reads
+# High-res reads only #
+reads %>% filter(MOTU %in% (taxonomy %>% filter(MOTU_level == "species" | MOTU_level == "genus" | MOTU_level == "family") %>% pull(MOTU) %>% unique())) -> reads
+
+#### Evaluate post-QC reads ####
+reads$RA %>% sum() %>% comma() -> postQC.RA
+postQC.RA
+
+reads %>% group_by(sample) %>% summarise(RA = sum(RA)) %>%
+  ungroup() %>% pull(RA) %>% mean() %>% signif(digits = 3) %>%
+  comma()  -> postQC.mean.RA
+postQC.mean.RA
+
+(length(unique(reads$ASV_ID))) %>% comma() -> postQC.ASV.S
+postQC.ASV.S
+
+#### Archive ####
+MOTU.ASV.archive = reads %>% group_by(MOTU) %>%
+  summarise(constituent.ASVs = paste(ASV_ID, collapse = ", "))
+reads -> reads.archive
+# Master contaminant table with reasons for removal #
+gw.ASVs %>% as.data.frame() %>% dplyr::rename("ASV_ID" = 1) %>%
+  mutate(dropped_cause = "Gray whale ASV") -> x
+contaminant.ASVs %>% distinct(ASV_ID) %>% mutate(dropped_cause = "Contaminant") -> y
+raw.reads %>% distinct(ASV_ID) %>%
+  filter(!ASV_ID %in% x$ASV_ID & !ASV_ID %in% y$ASV_ID & !ASV_ID %in% reads$ASV_ID) %>%
+  mutate(dropped_cause = "Below QC Threshold") -> z
+
+rbind(x, y, z) %>% left_join(., blast, by = "ASV_ID",
+                             relationship = "many-to-many") -> dropped_ASVs
+dropped_ASVs %>% dplyr::select(ASV_ID, dropped_cause,
+                               MOTU, MOTU_level, db_source,
+                               taxonomy_query, accession, NCBI_taxID,
+                               percent_identity, e_value, bit_score) -> TableS1
+kable(TableS1) %>% kable_minimal() # Supplementary Table 1
+```
+
+A number of ASVs were omitted ahead of proper analysis.
+
+## SEAWATER CONTROLS COMPARISON
+
+```{r Seawater controls}
+control.df = left_join(control.metadata, raw.reads, by = "sample") %>%
+  dplyr::select(-MOTU) %>%
+  left_join(taxonomy, by = "ASV_ID", relationship = "many-to-many") %>%
+  dplyr::select(sample, ASV_ID, MOTU, MOTU_level, type, RA, diet_item)
+
+raw.reads %>%
+  left_join(metadata, by = "sample") %>%
+  filter(type == "dDNA_E.robustus") %>%
+  dplyr::select(-MOTU) %>%
+  left_join(taxonomy, by = "ASV_ID", relationship = "many-to-many") %>%
+  dplyr::select(sample, ASV_ID, MOTU, MOTU_level, type, RA, diet_item) %>%
+  rbind(control.df) %>%
+  mutate(type = case_when(
+    type == "prey_positive" ~ "Prey Sample",
+    type == "field_negative" ~ "eDNA",
+    type == "PCR_negative" ~ "PCR Negative",
+    type == "dDNA_E.robustus" ~ "dDNA",
+    TRUE ~ type
+  )) -> control.df
+
+control.df %>%
+  mutate(diet_item = case_when(
+    MOTU %in% c("Eschrichtiidae", "Eschrichtius robustus") ~ "Gray Whale",
+    TRUE ~ diet_item
+  )) %>%
+  filter(type != "Prey Sample") -> control.df
+
+control.df %>%
+  filter(!is.na(diet_item)) %>%
+  group_by(type, diet_item) %>%
+  summarise(RA = sum(RA), .groups = "drop") %>%
+  ggplot(aes(x = type, y = RA, fill = diet_item)) +
+  geom_bar(stat = "identity", colour = "black", width = 0.66) +
+  scale_fill_manual(
+    values = c(
+      "#1B9E77",
+      "#E69F00",
+      "#D55E00",
+      "#A6761D",
+      "#F0E442",
+      "#7570B3",
+      "white",
+      "#006299",
+      "#CC79A7",
+      "#4D4D4D",
+      "#E41A1C"
+    )
+  ) +
+  # coord_flip() + scale_x_discrete(limits = rev) +
+  theme(
+    legend.position = "none",
+    panel.background = element_rect(fill = "#ADC7DB"),
+    axis.line = element_line(colour = "black"),
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)
+  ) +
+  labs(
+    title = "A. Read Abundance (RA)",
+    x = "",
+    y = "RA",
+    fill = "Detected Taxa"
+  ) -> A
+
+control.df %>%
+  filter(!is.na(diet_item)) %>%
+  group_by(type, diet_item) %>%
+  summarise(RA = sum(RA), .groups = "drop") %>%
+  ggplot(aes(x = type, y = RA, fill = diet_item)) +
+  geom_bar(
+    stat = "identity",
+    colour = "black",
+    width = 0.66,
+    position = "fill"
+  ) +
+  scale_fill_manual(
+    values = c(
+      "#1B9E77",
+      "#E69F00",
+      "#D55E00",
+      "#A6761D",
+      "#F0E442",
+      "#7570B3",
+      "white",
+      "#006299",
+      "#CC79A7",
+      "#4D4D4D",
+      "#E41A1C"
+    )
+  ) +
+  # coord_flip() + scale_x_discrete(limits = rev) +
+  theme(
+    legend.position = "none",
+    panel.background = element_rect(fill = "#ADC7DB"),
+    axis.line = element_line(colour = "black"),
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)
+  ) +
+  labs(
+    title = "B. Relative Read Abundance (RRA)",
+    x = "",
+    y = "RRA",
+    fill = "Detected Taxa"
+  ) -> B
+
+
+control.df %>%
+  filter(!is.na(diet_item)) %>%
+  dplyr::select(type, ASV_ID, diet_item) %>%
+  mutate(diet_item = case_when(
+    diet_item == "Algae/Phytoplankton" ~ "Algae/Phytop.",
+    TRUE ~ diet_item
+  )) %>%
+  distinct() %>%
+  mutate(count = 1) %>%
+  group_by(type, diet_item) %>%
+  summarise(count = sum(count), .groups = "drop") %>%
+  ggplot(aes(x = diet_item, y = count, fill = diet_item)) +
+  geom_bar(stat = "identity", colour = "black", width = 0.66) +
+  scale_fill_manual(
+    values = c(
+      "#1B9E77",
+      "#E69F00",
+      "#D55E00",
+      "#A6761D",
+      "#F0E442",
+      "#7570B3",
+      "white",
+      "#006299",
+      "#CC79A7",
+      "#4D4D4D",
+      "#E41A1C"
+    )
+  ) +
+  # coord_flip() + scale_x_discrete(limits = rev) +
+  theme(
+    legend.position = "none",
+    panel.background = element_rect(fill = "#ADC7DB"),
+    axis.line = element_line(colour = "black"),
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)
+  ) +
+  labs(
+    title = "C. ASV Diversity",
+    x = "",
+    y = "ASV Richness",
+    fill = "Detected Taxa"
+  ) +
+  facet_wrap(~type) -> C
+
+ggarrange((A / B) | C, common.legend = TRUE, legend = "right") -> fig.A1
+fig.A1 # Appendix fig. 1
+
+control.df %>%
+  filter(type == "eDNA") %>%
+  distinct(ASV_ID, MOTU) -> eDNA.ASVs
+
+control.df %>%
+  filter(type == "dDNA") %>%
+  distinct(ASV_ID, MOTU) -> dDNA.ASVs
+
+setdiff(eDNA.ASVs, dDNA.ASVs) %>%
+  left_join(.,
+  (blast %>% distinct(ASV_ID, sequence, MOTU_level,
+   db_source, taxonomy_query, accession,
+   NCBI_taxID, percent_identity, e_value, bit_score)), by = "ASV_ID") -> TableS2
+kable(TableS2) %>% kable_minimal()
+
+#### Do an ordination ####
+control.df %>% group_by(ASV_ID) %>%
+  summarise(RA = sum(RA)) %>% arrange(RA) %>%
+  filter(!ASV_ID %in% contaminant.ASVs$ASV_ID) %>% # Remove contaminants
+  pull(ASV_ID) -> ASVs_to_ordinate
+control.df %>% group_by(sample) %>%
+ summarise(RA = sum(RA)) %>% arrange(RA) %>% 
+ filter(RA >= 100) %>% # Let's omit samples under 100 reads
+  pull(sample) -> samples_to_ordinate
+control.df %>% filter(ASV_ID %in% ASVs_to_ordinate &
+                      sample %in% samples_to_ordinate) -> control.df
+control.df %>% distinct(sample, type) -> ordination.meta
+control.df %>%
+  dplyr::select(sample, ASV_ID, RA) %>%
+  pivot_wider(names_from = "ASV_ID", values_from = "RA", values_fn = sum) %>%
+  column_to_rownames(var = "sample") %>%
+  mutate(across(1:ncol(.), ~replace_na(.x, 0))) -> ASV.comm
+ASV.comm %>% decostand(method = "rclr") %>%
+  vegdist(., method = "euclidean") %>% cmdscale(eig = TRUE) -> ASV.pcoa
+ASV.pcoa$eig %>% data.frame() %>% filter(. > 0) %>% sum() -> x
+(ASV.pcoa$eig[1] / x)*100
+(ASV.pcoa$eig[2] / x)*100
+
+ASV.pcoa$points %>% data.frame() %>%
+  rownames_to_column(var = "sample") %>% dplyr::rename("PCo1" = "X1",
+                                                       "PCo2" = "X2") %>%
+  left_join(., ordination.meta, by = "sample") %>%
+  ggplot() +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_point(aes(x = PCo1, y = PCo2, color = type, shape = type), size = 2.5) +
+  scale_color_manual(values = c("#E69F00", "#006299", "#E41A1C")) +
+  labs(
+    title = "A.",
+    #subtitle = bquote("PERMANOVA R"^2 ~ "= 0.34"),
+    x = "PCo1 (68.7 % variance explained)",
+    y = "PCo2 (22.7% variance explained)", color = "Sample Type",
+    shape = "Sample Type") +
+    theme_bw() +
+  theme(
+    legend.position = "right",
+    legend.background = element_blank(),
+    legend.box.background = element_rect(color = "black")) -> Fig.S1
+Fig.S1
+```
+
+# Establishing RA Cutoff
+
+```{r Read abundance exploratory figures}
+#| echo: false
+reads %>% group_by(sample) %>% summarise(RA = sum(RA)) %>% ungroup() -> test.reads
+test.reads %>%
+  ggplot(aes(x = RA)) + geom_histogram(bins = 100, fill = "#006299") +
+  geom_vline(xintercept = 7202, linetype = "dashed", color = "#E69F00", linewidth = 1) +
+  theme_bw() + labs(x = "RA", y = "Count", title = "A",
+                    caption = "Vertical dashed line represents the mean") -> A
+# A / B
+
+# How many are above this threshold? #
+test.reads %>% filter(RA >= 7202) %>% pull(sample) %>% length()
+# 51 are above #
+# Below? #
+test.reads %>% filter(RA < 7202) %>% pull(sample) %>% length()
+# 132 are below #
+quantile(test.reads$RA) %>% data.frame() %>% rownames_to_column(var = "Quantile") %>%
+  dplyr::rename("RA" = 2)
+0.25*length(unique(reads$sample)) # You'd lose around 45 samples by a 1,000-read cutoff
+
+# What is the distribution of reads like for the bottom quantile? #
+test.reads %>% filter(RA <= 1000) %>%
+  ggplot(aes(x = RA)) + geom_histogram(bins = 50, fill = "#006299") +
+  theme_bw() + labs(x = "RA", y = "Count", title = "B", caption = "<1,000 RA") -> B
+test.reads %>% filter(RA <= 1000) %>% pull(sample) %>% length()
+test.reads %>% filter(RA <= 1000) %>% pull(RA) %>% quantile() %>%
+  data.frame() %>% rownames_to_column(var = "Quantile") %>%
+  dplyr::rename("RA" = 2)
+
+A / B
+
+# Is there a relationship between read count and MOTU richness? #
+reads %>% group_by(sample) %>% summarise(S = n_distinct(MOTU)) %>% ungroup() %>%
+  left_join(., test.reads, by = "sample") %>%
+  ggplot(aes(x = RA, y = S)) + geom_point() + theme_bw() +
+  stat_cor(method = "spearman", cor.coef.name = "rho") +
+  geom_smooth(method = "loess") + labs(y = "MOTU Richness (S)")
+reads %>% group_by(sample) %>% summarise(S = n_distinct(MOTU)) %>% ungroup() %>%
+  pull(S) %>% mean() # Avg. richness
+reads %>% group_by(sample) %>% summarise(S = n_distinct(MOTU)) %>% ungroup() %>%
+  pull(S) %>% sd() # Standard deviation
+reads %>% group_by(sample) %>% summarise(S = n_distinct(MOTU)) %>% ungroup() %>%
+  left_join(., test.reads, by = "sample") %>%
+  arrange(desc(S)) %>% View()
+```
+
+```{r Rarefaction visualization}
+reads %>% group_by(sample, MOTU) %>% summarise(RA = sum(RA)) %>% ungroup() %>%
+  pivot_wider(names_from = "MOTU", values_from = "RA") %>% column_to_rownames(var = "sample") %>%
+  mutate(across(1:ncol(.), ~replace_na(.x, 0))) -> dDNA.comm
+
+S = specnumber(dDNA.comm) # MOTU richness per sample #
+mean(S) # Average MOTU richness #
+sd(S) # With standard deviation
+raremax = 391 # Read depth, from under 1,000 RA quantiles
+rarefy(dDNA.comm, raremax) -> Srare
+
+# Plot #
+S %>% data.frame() %>% dplyr::rename(S = 1) %>%
+  rownames_to_column(var = "sample") %>%
+  left_join(., (Srare %>% data.frame() %>%
+                  dplyr::rename(Srare = 1) %>%
+  rownames_to_column(var = "sample")),
+  by = "sample") %>%
+  ggplot(aes(x = S, y = Srare)) +
+  geom_point(color = "#006299") + geom_abline() +
+  geom_smooth(method=  glm, color = "#ADC7DB", fill = "#006299") +
+  theme_bw() +
+  labs(x = "Observed MOTU Richness",
+       y = "Rarefied MOTU Richness",
+       title = "A", adj = 0) -> a
+rarecurve(dDNA.comm, step = 100, sample = raremax, tidy = TRUE) %>%
+  ggplot(aes(x = Sample, y = Species, color = Site)) +
+  geom_line(linewidth = 0.8) +
+  labs(x = "Sequence Read Abundance", y = "MOTU Richness", color = "Sample",
+       title = "B",
+  caption =
+  glue("Vertical dashed line represents sequencing/rarefaction depth: {raremax} reads")) +
+  theme_bw() + theme(legend.position = "none") +
+  geom_vline(xintercept = raremax, linetype = "dashed", linewidth = 1) -> b
+a / b -> Fig.S2 # SupMat figure 2
+Fig.S2
+
+reads %>% group_by(sample) %>% summarise(RA = sum(RA)) %>%
+  filter(RA >= raremax) %>% pull(sample) %>%
+  unique() -> samples.passing.rarefaction
+samples.passing.rarefaction
+samples.passing.rarefaction %>% length()
+```
+
+```{r Repeat at 961 read depth for additional supplementary fig}
+raremax2 = 968
+rarefy(dDNA.comm, raremax2) -> Srare
+
+# Plot #
+S %>% data.frame() %>% dplyr::rename(S = 1) %>%
+  rownames_to_column(var = "sample") %>%
+  left_join(., (Srare %>% data.frame() %>%
+                  dplyr::rename(Srare = 1) %>%
+  rownames_to_column(var = "sample")),
+  by = "sample") %>%
+  ggplot(aes(x = S, y = Srare)) +
+  geom_point(color = "#006299") + geom_abline() +
+  geom_smooth(method=  glm, color = "#ADC7DB", fill = "#006299") +
+  theme_bw() +
+  labs(x = "Observed MOTU Richness",
+       y = "Rarefied MOTU Richness",
+       title = "A", adj = 0) -> a
+rarecurve(dDNA.comm, step = 100, sample = raremax, tidy = TRUE) %>%
+  ggplot(aes(x = Sample, y = Species, color = Site)) +
+  geom_line(linewidth = 0.8) +
+  labs(x = "Sequence Read Abundance", y = "MOTU Richness", color = "Sample",
+       title = "B",
+  caption =
+  glue("Vertical dashed line represents sequencing/rarefaction depth: {raremax2} reads")) +
+  theme_bw() + theme(legend.position = "none") +
+  geom_vline(xintercept = raremax2, linetype = "dashed", linewidth = 1) -> b
+a / b -> Fig.S3 # SupMat figure 3
+Fig.S3
+```
+
+```{r Apply minimum depth threshold}
+reads %>% filter(sample %in% samples.passing.rarefaction) -> reads
+
+reads %>% filter(sample %in% gw.dDNA.samples) %>% pull(sample) %>% unique() %>%
+  length() -> postQC.n
+postQC.n # 159 samples #
+```
+
+```{r BLAST output comparisons to Benthos-ceviche, include = FALSE}
+robust.taxonomy = taxonomy %>%
+  left_join(., blast, by = c(
+    intersect(colnames(taxonomy), colnames(blast)))) %>%
+  filter(ASV_ID %in% reads.archive$ASV_ID) %>%
+  dplyr::select(-c(prey_group, sequence, seq_length,
+                   accession:bit_score,
+                   kingdom:species)) %>% unique() %>%
+  group_by(ASV_ID) %>% unique() %>%
+  mutate(db_source = paste(db_source, collapse = "/")) %>%
+  ungroup()
+# Combines both the taxonomy and BLAST metadata #
+# It's Megazord time! #
+
+robust.taxonomy %>% group_by(db_source) %>%
+  summarise(n = n_distinct(ASV_ID)) %>% kable()
+
+#Plot 1
+robust.taxonomy %>% group_by(db_source) %>% distinct() %>%
+  count(diet_item) %>%
+  mutate(db_source = case_when(
+    db_source == "NCBI_nt" ~ "GenBank",
+    db_source == "custom_db" ~ "Custom Reference Dataset",
+    TRUE ~ "Database agreement"
+  )) %>%
+  ungroup() %>% group_by(db_source, diet_item) %>%
+  summarise(n = sum(n)) %>%
+  ggplot(aes(x = diet_item, y = n, fill = diet_item)) +
+  geom_bar(stat = "identity", colour = "black", width = 0.5) +
+  facet_wrap(~db_source) + coord_flip() +
+  scale_x_discrete(limits = rev) +
+  scale_fill_manual(
+    values = c("#1B9E77", "#E69F00", "#D55E00", "#A6761D", "#F0E442",
+               "#7570B3", "#006299", "#CC79A7", "#4D4D4D", "#E41A1C")) +
+    theme(legend.position = "none",
+        panel.background = element_rect(fill = "#ADC7DB"),
+        axis.line = element_line(colour = "black")) +
+  labs(title = "A. Sequence Variant Match Source", x = "", y = "ASV Richness") -> A
+# Plot 2
+reads.archive %>% left_join(., robust.taxonomy,
+                            by = c("ASV_ID", "MOTU"),
+                    relationship = "many-to-many") %>%
+    mutate(db_source = case_when(
+    db_source == "NCBI_nt" ~ "GenBank",
+    db_source == "custom_db" ~ "Custom Reference Dataset",
+    TRUE ~ "Database agreement"
+  )) %>%
+    mutate(ASV_ID = paste0(MOTU, " (", "ASV", " ", c(1:nrow(.)), ")")) %>%
+  group_by(ASV_ID, db_source) %>%
+  summarise(RA = sum(RA)) %>%
+  arrange(desc(RA)) %>%
+  ungroup() %>%
+  mutate(RA = (RA/sum(RA))) %>%
+  ungroup() %>%
+  slice_head(n = 50) %>%
+  ggplot(aes(x = reorder(ASV_ID, RA), y = RA*100,
+             fill = db_source)) +
+  geom_bar(stat = "identity", colour = "black", width = 0.75) +
+  scale_x_discrete(limits = rev) +
+  scale_fill_viridis(discrete = TRUE, option = "C",
+                     direction = -1) +
+    theme(legend.position = "bottom",
+        panel.background = element_rect(fill = "#ADC7DB"),
+        axis.line = element_line(colour = "black"),
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 7)) +
+  labs(title = "B. Highest-Read Sequence Variants",
+       caption = "Top 50 most-abundant ASVs shown", x = "",
+       y = "% RRA",
+       fill = "ASV Taxonomic Match Source") -> B
+
+A / B -> Fig.A2
+Fig.A2
+```
+
+## Fig. 1: Study Area / Sample Distribution Map
+
+```{r}
+# City locations
+tibble(cities = c("Port Orford", "Newport", "Depoe Bay"),
+       lat = c(42.7468, 44.6324, 44.8092),
+       long = c(-124.5043, -124.0516, -124.0587)) -> city.points
+
+# Bounding box coordinates
+-125.0 -> long1
+-123.4 -> long2
+42.0 -> lat1
+46.3 -> lat2
+
+st_bbox(c(xmin = long1, xmax = long2, ymin = lat1, ymax = lat2),
+        crs = st_crs(4326)) -> bbox
+
+# Bathymetry
+getNOAA.bathy(long1, long2, lat1, lat2, resolution = 1) -> bathy
+as.xyz(bathy) %>%
+  dplyr::rename(long = 1, lat = 2, depth = 3) %>%
+  mutate(depth = if_else(depth > 0, 0, depth)) -> bathy.df
+
+# High-resolution land
+ne_countries(scale = "large", returnclass = "sf") %>%
+  st_make_valid() %>%
+  st_crop(bbox) -> land
+
+# Shared base map (without city labels)
+ggplot() +
+  geom_raster(data = bathy.df, aes(long, lat, fill = depth)) +
+  geom_contour(data = bathy.df, aes(long, lat, z = depth),
+               breaks = c(-300, -200, -100, -50, -20, -10),
+               colour = "white", linewidth = 0.25) +
+  geom_sf(data = land, fill = "white", colour = "black", linewidth = 0.2) +
+  scale_fill_gradientn(colours = c("grey10", "grey35", "grey55", "grey75", "grey95"),
+                       values = rescale(c(-300, -150, -75, -25, 0)),
+                       limits = c(-300, 0), oob = squish, name = "Depth (m)") +
+  ggnewscale::new_scale_fill() +
+  geom_point(data = metadata, aes(long, lat), shape = 21, fill = "#E69F00",
+             colour = "white", stroke = 0.3, size = 1.5) +
+  scale_x_continuous(
+  breaks = scales::pretty_breaks(n = 5)) +
+  labs(x = "Longitude", y = "Latitude") +
+  theme_bw() +
+  theme(legend.position = "right",
+        axis.text.x = element_text(angle = 45, vjust = 0.5),
+        plot.title = element_text(face = "bold", size = 12)) ->
+  map
+
+# Overview with city labels and study-area boxes
+map +
+  coord_sf(xlim = c(-125.0, -123.5), ylim = c(42.0, 46.3), expand = FALSE) +
+  geom_rect(data = tibble(
+    xmin = c(-124.25, -124.65), xmax = c(-123.85, -124.25),
+    ymin = c(44.35, 42.60), ymax = c(45.00, 42.90)),
+  aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
+  inherit.aes = FALSE, fill = NA, colour = "#E41A1C", linewidth = 0.6) +
+  shadowtext::geom_shadowtext(
+  data = city.points,
+  aes(long, lat, label = cities),
+  fontface = "bold",
+  size = 3.3,
+  nudge_x = 0.05,
+  colour = "black",
+  bg.colour = "white",
+  bg.r = 0.15) +
+  labs(title = "A", subtitle = "Oregon Coast, USA") -> map.overview
+
+# Newport–Depoe Bay detail (no city labels)
+map + coord_sf(xlim = c(-124.25, -123.85), ylim = c(44.35, 45.00),
+               expand = FALSE) +
+  labs(title = "B", subtitle = "Newport & Depoe Bay",
+       ) -> map.newport
+
+# Port Orford detail (no city labels)
+map + coord_sf(xlim = c(-124.65, -124.25), ylim = c(42.60, 42.90),
+               expand = FALSE) +
+  labs(title = "C", subtitle = "Port Orford") -> map.portorford
+
+# Three-panel layout
+(map.overview | (map.newport / map.portorford)) +
+  plot_layout(widths = c(1, 1.5), guides = "collect") &
+  theme(legend.position = "right") -> Fig1
+Fig1
+```
+
+## dDNA Alpha Diversity
+
+```{r Master dataframe, include = FALSE}
+reads %>%
+  left_join(., (taxonomy[,-1] %>% unique()), by = "MOTU") %>%
+  left_join(., metadata, by = "sample") -> df
+df %>% group_by(sample) %>% mutate(RRA = RA/sum(RA)) %>% ungroup() -> df
+
+# Presence/absence #
+df %>% mutate(PA = 1) %>% dplyr::select(sample, MOTU, RRA, PA, RA,
+                                        everything()) -> df
+# Weighted percentage of occurrence #
+df %>% group_by(sample) %>% summarise(sample.pres = sum(PA)) %>%
+  ungroup() %>% left_join(., df, by = "sample") %>%
+  mutate(wPOO = PA / sample.pres) %>%
+  dplyr::select(sample, MOTU, RA, RRA, PA, wPOO, everything()) %>%
+  dplyr::select(-sample.pres) -> df
+```
+
+```{r Calculating alpha diversity metrics, include = FALSE}
+df %>% dplyr::select(MOTU, MOTU_level) %>% unique() %>%
+  group_by(MOTU_level) %>% count() %>% data.frame() %>%
+  ungroup() %>%
+  mutate(MOTU_level = factor(MOTU_level, levels = c(
+    "phylum", "class", "order", "family", "genus", "species"
+  ))) %>% arrange(MOTU_level) %>% kable(
+    col.names = c("Parsimonious MOTU Level",
+                  "MOTU Richness"))
+# RRA and wPOO by group #
+df %>% group_by(diet_item) %>% summarise(RRA = sum(RRA), wPOO = sum(wPOO)) %>%
+  mutate(RRA = 100*(RRA/sum(RRA)), wPOO = 100*(wPOO/sum(wPOO))) %>%
+  arrange(desc(RRA))
+df %>% group_by(diet_item) %>% summarise(RRA = sum(RRA), wPOO = sum(wPOO)) %>%
+  mutate(RRA = 100*(RRA/sum(RRA)), wPOO = 100*(wPOO/sum(wPOO))) %>%
+  arrange(desc(wPOO))
+
+df %>% filter(phylum != "Arthropoda") %>%
+  group_by(diet_item) %>%
+  summarise(richness = n_distinct(MOTU)) # Number of non-arthropod MOTUs
+# 246 MOTUs
+df %>% filter(phylum != "Arthropoda" & MOTU_level == "species") %>%
+  group_by(diet_item) %>%
+  summarise(richness = n_distinct(MOTU)) # Number of species-level non-arthropod MOTUs
+# 182 species-level MOTUs
+
+df %>% group_by(MOTU, phylum, diet_item) %>%
+  summarise(RRA = sum(RRA)) %>% ungroup() %>% mutate(RRA = 100*(RRA/sum(RRA))) %>%
+  # filter(phylum != "Arthropoda") %>%
+  group_by(MOTU, diet_item) %>%
+  summarise(RRA = sum(RRA)) %>%
+  ungroup() %>% group_by(diet_item) %>%
+  mutate(RRA_group_percent = 100*RRA/sum(RRA)) %>%
+  arrange(desc(RRA)) -> x
+df %>% group_by(MOTU, phylum, diet_item) %>%
+  summarise(wPOO = sum(wPOO)) %>% ungroup() %>% mutate(wPOO = 100*(wPOO/sum(wPOO))) %>%
+  # filter(phylum != "Arthropoda") %>%
+  group_by(MOTU, diet_item) %>%
+  summarise(wPOO = sum(wPOO)) %>%
+  ungroup() %>% group_by(diet_item) %>%
+  mutate(wPOO_group_percent = 100*wPOO/sum(wPOO)) %>%
+  arrange(desc(wPOO)) -> y
+full_join(x, y, by = c("MOTU", "diet_item")) -> percent_metrics
+percent_metrics %>% filter(diet_item == "Other")
+
+df %>% group_by(diet_item) %>% na.omit() %>%
+  summarise(Phyla = n_distinct(phylum),
+            Classes = (n_distinct(class)),
+            Orders = n_distinct(order),
+            Families = n_distinct(family),
+            Genera = n_distinct(genus),
+            Species = n_distinct(species)) -> Table1
+Table1 %>% kable() %>% kable_minimal()
+
+# Order by presence/absence #
+df %>%
+  dplyr::select(sample, diet_item, MOTU, PA) %>%
+  unique() %>%
+  group_by(MOTU, diet_item) %>%
+  summarise(PA = sum(PA)) %>%
+  ungroup() %>%
+  arrange(desc(PA)) %>%
+  group_by(diet_item) %>%
+  mutate(percent_occurrence = 100*(PA/length(unique(df$sample)))) %>%
+  dplyr::select(-PA) -> x
+df %>% dplyr::select(MOTU, diet_item, RRA, wPOO) %>%
+  group_by(MOTU, diet_item) %>%
+  summarise(wPOO = sum(wPOO), RRA = sum(RRA)) %>%
+  ungroup() %>%
+  mutate(wPOO = (100) * (wPOO/sum(wPOO)),
+         RRA = (100) * (RRA/sum(RRA))) %>%
+  left_join(., x, by = c("MOTU", "diet_item")) %>%
+  group_by(diet_item) %>%
+  slice_max(order_by = percent_occurrence, n = 5,
+            with_ties = FALSE) -> Table2
+Table2 %>% kable() %>% kable_minimal()
+```
+
+```{r Components for illustration fig., echo = FALSE, warning = FALSE, message = FALSE}
+plot.df = df %>% group_by(diet_item, sample) %>%
+  summarise(RRA = sum(RRA),
+            wPOO = sum(wPOO),
+            PA = sum(PA)) %>%
+  ungroup() %>% mutate(RRA = RRA/length(unique(df$sample)),
+                   wPOO = wPOO/(length(unique(df$sample))))
+
+plot.df %>%
+  ggplot() +
+  geom_bar(aes(x = sample, y = RRA,
+               fill = diet_item),
+           stat = "identity",
+           width = 1, position = "fill") +
+  scale_x_discrete(limits = rev) + scale_y_continuous(expand = c(0, 0)) +
+  scale_fill_manual(
+    values = c("#1B9E77", "#E69F00", "#D55E00", "#A6761D", "#F0E442",
+               "#7570B3", "#006299", "#CC79A7", "#4D4D4D", "#E41A1C")) +
+  theme(legend.position = "none",
+        panel.background = element_rect(fill = "white"),
+        axis.line = element_line(colour = "black"),
+        axis.text.x = element_blank()) +
+  labs(title = "A. Relative Read Abundance (RRA)", x = "dDNA Samples", y = "RRA",
+       fill = "Diet Items") -> A
+plot.df %>%
+  mutate(tot.wRRA = sum(RRA)) %>%
+  mutate(RRA = RRA/tot.wRRA) %>%
+  group_by(diet_item) %>%
+  summarise(RRA = sum(RRA)) %>%
+  ggplot() +
+  geom_bar(aes(x = diet_item, y = 100*RRA,
+               fill = diet_item),
+           stat = "identity",
+           width = 0.75,
+           color = "black") +
+  coord_flip() +
+  ylim(0, 30) +
+  scale_x_discrete(limits = rev) +
+  scale_fill_manual(
+    values = c("#1B9E77", "#E69F00", "#D55E00", "#A6761D", "#F0E442",
+               "#7570B3", "#006299", "#CC79A7", "#4D4D4D", "#E41A1C")) +
+  theme(legend.position = "none",
+        panel.background = element_rect(fill = "white"),
+        axis.line = element_line(colour = "black"),
+        axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+  labs(x = "", y = "RRA", title = "B. Summed Totals (% RRA)",
+       fill = "Diet Items") -> B
+
+plot.df %>%
+  ggplot() +
+  geom_bar(aes(x = sample, y = wPOO,
+               fill = diet_item),
+           stat = "identity",
+           width = 1, position = "fill") +
+  scale_x_discrete(limits = rev) + scale_y_continuous(expand = c(0, 0)) +
+  scale_fill_manual(
+    values = c("#1B9E77", "#E69F00", "#D55E00", "#A6761D", "#F0E442",
+               "#7570B3", "#006299", "#CC79A7", "#4D4D4D", "#E41A1C")) +
+  theme(legend.position = "none",
+        panel.background = element_rect(fill = "white"),
+        axis.line = element_line(colour = "black"),
+        axis.text.x = element_blank()) +
+  labs(title = "C. Weighted Percentage of Occurrence (wPOO)", x = "dDNA Samples", y = "wPOO",
+       fill = "Diet Items") -> C
+
+plot.df %>%
+  mutate(tot.wPOO = sum(wPOO)) %>%
+  mutate(wPOO = wPOO/tot.wPOO) %>%
+  group_by(diet_item) %>%
+  summarise(wPOO = sum(wPOO)) %>%
+  ggplot() +
+  geom_bar(aes(x = diet_item, y = 100*wPOO,
+               fill = diet_item),
+           stat = "identity",
+           width = 0.75,
+           color = "black") +
+  coord_flip() +
+  scale_x_discrete(limits = rev) +
+  ylim(0, 30) +
+  scale_fill_manual(
+    values = c("#1B9E77", "#E69F00", "#D55E00", "#A6761D", "#F0E442",
+               "#7570B3", "#006299", "#CC79A7", "#4D4D4D", "#E41A1C")) +
+  theme(legend.position = "none",
+        panel.background = element_rect(fill = "white"),
+        axis.line = element_line(colour = "black"),
+        axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+  labs(x = "", y = "wPOO", title = "D. Summed Totals (% wPOO)",
+       fill = "Diet Items") -> D
+ggarrange(A, B,
+          C, D, common.legend = TRUE, legend = "top") %>%
+  annotate_figure(bottom = text_grob("n = 159", 
+                                   hjust = 1.5, x = 1, 
+                                   face = "italic", size = 10)) -> Fig.2
+Fig.2
+```
+
+```{r Trophic grid}
+#| message: false
+df %>% 
+  dplyr::select(MOTU, RRA, diet_item, wPOO) %>% filter(RRA > 0) %>%
+  mutate(RRA = RRA/sum(RRA)) %>% mutate(wPOO = wPOO/sum(wPOO)) %>%
+  group_by(diet_item) %>% summarise(RRA = sum(RRA), wPOO = sum(wPOO)) %>% ungroup() %>%
+  ggplot(aes(y = RRA*100, x = wPOO*100, color = diet_item)) +
+  geom_hline(yintercept = (df %>% 
+    dplyr::select(MOTU, RRA, diet_item, wPOO) %>% filter(RRA > 0) %>%
+    mutate(RRA = RRA/sum(RRA)) %>% mutate(wPOO = wPOO/sum(wPOO)) %>%
+    group_by(diet_item) %>% summarise(RRA = sum(RRA), wPOO = sum(wPOO)) %>%
+    ungroup() %>% pull(RRA) %>% mean() * 100)) +
+  geom_vline(xintercept = (df %>% 
+    dplyr::select(MOTU, RRA, diet_item, wPOO) %>% filter(RRA > 0) %>%
+    mutate(RRA = RRA/sum(RRA)) %>% mutate(wPOO = wPOO/sum(wPOO)) %>%
+    group_by(diet_item) %>% summarise(RRA = sum(RRA), wPOO = sum(wPOO)) %>%
+    ungroup() %>% pull(wPOO) %>% mean() * 100)) +
+  geom_point(size = 3) +
+  geom_label_repel(aes(label = diet_item, fontface = "bold"), size = 3) +
+  theme_bw() + theme(legend.position = "none") +
+  scale_color_manual(
+    values = c(
+  "#1B9E77", "#E69F00", "#D55E00", "#A6761D", "#d8cd3b",
+  "#7570B3", "#006299", "#CC79A7", "#4D4D4D", "#E41A1C" )) +
+  # xlim(c(0, 20)) + ylim(c(0, 25)) +
+  labs(y = "% RRA", x = "% wPOO",
+       title = "A.",
+       subtitle = "Diet item categories",
+       color = "Diet Item Category", label = "Diet Item Category") -> A
+
+df %>% dplyr::select(RRA, diet_item, order, wPOO) %>%
+  group_by(order, diet_item) %>% summarise(RRA = sum(RRA), wPOO = sum(wPOO)) %>% ungroup() %>%
+  mutate(RRA = 100*(RRA/sum(RRA)),
+         wPOO = 100*(wPOO/sum(wPOO))) %>%
+  filter(diet_item == "Malacostracans" & order != "Isopoda") %>%
+  filter(RRA > 0) %>%
+  group_by(order) %>% summarise(RRA = sum(RRA), wPOO = sum(wPOO)) %>%
+  ungroup() -> x
+x$RRA %>% mean() -> y
+x$wPOO %>% mean() -> z
+x %>% ggplot(aes(y = RRA, x = wPOO, color = order, label = order, shape = order)) +
+      geom_hline(yintercept = y) + geom_vline(xintercept = z) +
+  geom_point(size = 3) + scale_shape_manual(values = c(18, 19, 15, 17)) +
+  geom_label_repel(show.legend = FALSE, size = 3.0) +
+  theme_bw() + theme(legend.position = "none") +
+  scale_color_manual(values = c("#002B45","#006299","#00A3D9","#72b0c8")) +
+  # xlim(c(0, 15)) + ylim(c(0, 15)) +
+  labs(y = "% RRA", x = "% wPOO", title = "B.", subtitle = "Malacostracans") -> B
+
+df %>% dplyr::select(MOTU, RRA, diet_item, order, wPOO) %>%
+  group_by(order, MOTU, diet_item) %>%
+  summarise(RRA = sum(RRA), wPOO = sum(wPOO)) %>% ungroup() %>%
+  mutate(RRA = 100*(RRA/sum(RRA)),
+         wPOO = 100*(wPOO/sum(wPOO))) %>%
+  filter(diet_item == "Malacostracans" & order != "Isopoda") -> x
+x$RRA %>% mean() -> y
+x$wPOO %>% mean() -> z
+
+x %>%
+  ggplot(aes(y = RRA, x = wPOO, color = order, label = MOTU, shape = order)) +
+    geom_hline(yintercept = y) + geom_vline(xintercept = z) +
+  geom_point(size = 3) + scale_shape_manual(values = c(18, 19, 15, 17)) +
+  geom_label_repel(show.legend = FALSE, size = 2.5, max.overlaps = 40) +
+  theme_bw() + theme(legend.position = "left") +
+  scale_color_manual(values = c("#002B45","#006299","#00A3D9","#72b0c8")) +
+  # xlim(c(0, 7.5)) + ylim(c(0, 7.5)) +
+  labs(y = "% RRA", x = "% wPOO", title = "C.",
+       shape = "Taxonomic Order", color = "Taxonomic Order",
+       subtitle = "Malacostracan MOTUs",
+       caption = "Mean values used for intercept grid lines") -> C
+
+A / (B | C) -> Fig.3
+Fig.3
+```
+
+```{r Copepod ver. for supmat}
+df %>% dplyr::select(MOTU, RRA, diet_item, order, wPOO) %>%
+  group_by(order, MOTU, diet_item) %>%
+  summarise(RRA = sum(RRA), wPOO = sum(wPOO)) %>% ungroup() %>%
+  mutate(RRA = 100*(RRA/sum(RRA)),
+         wPOO = 100*(wPOO/sum(wPOO))) %>%
+  filter(diet_item == "Copepods") -> x
+x$RRA %>% mean() -> y
+x$wPOO %>% mean() -> z
+
+x %>%
+  ggplot(aes(y = RRA, x = wPOO, color = order, label = MOTU, shape = order)) +
+    geom_hline(yintercept = y) + geom_vline(xintercept = z) +
+  geom_point(size = 3) + scale_shape_manual(values = c(18, 19, 15, 17)) +
+  geom_label_repel(show.legend = FALSE, size = 2.5, max.overlaps = 40) +
+  theme_bw() + theme(legend.position = "left") +
+  scale_color_manual(values = c("#426B3A", "#347E9B", "#F0E442")) +
+  # xlim(c(0, 7.5)) + ylim(c(0, 7.5)) +
+  labs(y = "% RRA", x = "% wPOO",
+       shape = "Taxonomic Order", color = "Taxonomic Order",
+       subtitle = "Copepod MOTUs",
+       caption = "Mean values used for intercept grid lines") -> Fig.S5.maybe
+```
+
+## CLUSTER ANALYSIS
+
+```{r PCoA, echo = FALSE}
+# Turn off or on to apply more stringent read count #
+raremax = 968 # Use the 25% quantile to cut samples
+df %>% group_by(sample) %>% summarise(RA = sum(RA)) %>%
+  ungroup() %>% filter(RA >= raremax) %>% distinct(sample) -> samples.over.threshold
+df %>% filter(sample %in% samples.over.threshold$sample) -> ancom.df
+
+# Analysis start #
+set.seed(120396)
+ancom.df %>% dplyr::select(sample, MOTU, RA) %>% # Replace with metric #
+  pivot_wider(names_from = "MOTU", values_from = "RA", # Replace with metric #
+              values_fn = sum) %>%
+  column_to_rownames(var = "sample") %>%
+  mutate(across(1:ncol(.), ~replace_na(.x, 0))) %>%
+  # rrarefy(sample = raremax) %>%
+  as.data.frame() %>%
+  select(where(~ sum(.x, na.rm = TRUE) >= 2)) %>%
+  decostand(method = "total") %>%
+  decostand(method = "rclr") -> cluster.comm
+
+vegdist(cluster.comm, method = "euclidean") -> dist.matrix
+pamk(dist.matrix, krange = 1:10, diss = TRUE) -> PAM.out
+PAM.out$nc # Optimal no. #
+# hclust(dist.matrix) -> hclust.out
+# plot(hclust.out)
+# cutree(hclust.out, h = 20) %>% data.frame() %>%
+#   rownames_to_column(var = "sample") %>%
+#   dplyr::rename("cluster" = 2) %>%
+#   mutate(cluster = case_when(
+#     cluster == "1" ~ "A",
+#     cluster == "2" ~ "B",
+#     cluster == "3" ~ "C",
+#     cluster == "4" ~ "D",
+#     cluster == "5" ~ "E",
+#     cluster == "6" ~ "F")) -> hclust.cluster
+
+PAM.out$pamobject$clustering %>% data.frame() %>%
+  rownames_to_column(var = "sample") %>%
+  dplyr::rename("cluster" = 2) %>%
+  mutate(cluster = case_when(
+    cluster == "1" ~ "A",
+    cluster == "2" ~ "B",
+    cluster == "3" ~ "C",
+    cluster == "4" ~ "D",
+    cluster == "5" ~ "E")) -> PAM.cluster
+cluster.comm %>%
+  vegdist(., method = "euclidean") %>% cmdscale(eig = TRUE) -> x
+x$eig %>% sum() -> y
+(x$eig[1] / y)*100
+(x$eig[2] / y)*100
+
+cluster.comm %>%
+  vegdist(., method = "euclidean") %>% cmdscale(eig = FALSE) %>% data.frame() %>%
+  rownames_to_column(var = "sample") %>% dplyr::rename("PCo1" = "X1",
+                                                       "PCo2" = "X2") %>%
+  left_join(., PAM.cluster, by = "sample") %>%
+  ggplot() +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_point(aes(x = PCo1, y = PCo2, color = cluster, shape = cluster), size = 2) +
+  stat_ellipse(aes(x = PCo1, y = PCo2, color = cluster)) +
+      # geom_label_repel(data = sp.scores,
+      #              aes(x = V1, y = V2, label = MOTU),
+      #              size = 4) +
+  scale_color_manual(values = c("#26547c", "#CC79A7", "#1B9E77")) +
+  labs(
+    title = "A.",
+    subtitle = bquote("PERMANOVA R"^2 ~ "= 0.34"),
+    x = "PCo1 (55.6% variance explained)",
+    y = "PCo2 (24.0% variance explained)", color = "PAM Cluster", shape = "PAM Cluster") +
+    theme_bw() +
+  theme(
+    legend.position = "right",
+    legend.background = element_blank(),
+    legend.box.background = element_rect(color = "black")) -> plotA
+plotA
+# hexbin(x$PCo1, x$PCo2, xbins = 10) %>%
+#   plot(colramp=colorRampPalette(c("#7bd1a7", "#ef476f")), legend = F)
+
+cluster.comm %>%
+  vegdist(., method = "euclidean") %>% cmdscale(eig = FALSE) %>% data.frame() %>%
+  rownames_to_column(var = "sample") %>% dplyr::rename("PCo1" = "X1",
+                                                       "PCo2" = "X2") %>%
+  left_join(., PAM.cluster, by = "sample") -> a
+
+cluster.comm %>% data.frame() %>% rownames_to_column(var = "sample") %>%
+  left_join(., a, by = "sample") -> b
+
+adonis2(
+   cluster.comm ~ cluster,
+   data = PAM.cluster,
+   permutations = 999,
+   method = "euclidean",
+   by = "terms")  %>% data.frame() -> rclr.adonis.out
+rclr.adonis.out
+
+# Better format for PAM clustering #
+PAM.cluster %>% mutate(cluster = as.factor(cluster)) -> PAM.cluster
+```
+
+```{r Betadisper}
+# Measures of homogeneity #
+betadisper(dist.matrix, PAM.cluster$cluster) %>% anova()
+betadisper(dist.matrix, PAM.cluster$cluster) %>% TukeyHSD()
+betadisper(dist.matrix, PAM.cluster$cluster) %>% plot()
+# Non-significant results #
+```
+
+```{r ANCOM BC2}
+library(ANCOMBC)
+ancom.df %>% dplyr::select(sample, MOTU, RA) %>% # Replace with metric #
+  pivot_wider(names_from = "MOTU", values_from = "RA", # Replace with metric #
+              values_fn = sum) %>%
+  column_to_rownames(var = "sample") %>%
+  mutate(across(1:ncol(.), ~replace_na(.x, 0))) %>%
+  as.data.frame() %>%
+  select(where(~ sum(.x, na.rm = TRUE) >= 2)) %>%
+  decostand(method = "total") -> test.matrix
+PAM.cluster$sample -> rownames(PAM.cluster)
+ancombc2(
+  data = test.matrix, meta_data = PAM.cluster,
+  fix_formula = "cluster",
+  p_adj_method = "BH",
+  group = "cluster",
+  prv_cut = 0,
+  lib_cut = 0,
+  alpha = 0.05,
+  n_cl = 1,
+  rand_formula = NULL,
+  taxa_are_rows = FALSE,
+  struc_zero = FALSE,
+  global = FALSE,
+  pairwise = FALSE,
+  verbose = TRUE) -> ancom.out
+
+ancom.out$res %>% filter(diff_clusterB == TRUE) -> ancom.out
+ifelse(ancom.out$lfc_clusterB > 0, "Increasing", "Decreasing") -> ancom.out$direction 
+ancom.out %>%
+  mutate(MOTU = taxon,
+         lfc = lfc_clusterB,
+         se = se_clusterB) %>%
+  mutate(direct = ifelse(lfc_clusterB > 0, "Positive LFC", "Negative LFC")) %>%
+  left_join(., (ancom.df %>% distinct(MOTU, diet_item)), by = "MOTU") %>%
+  ggplot(aes(x = MOTU, y = lfc, fill = direct)) +
+  geom_bar(stat = "identity", width = 0.7, color = "black", 
+             position = position_dodge(width = 0.4)) +
+  geom_errorbar(aes(ymin = lfc - se, ymax = lfc + se), 
+                  width = 0.2, position = position_dodge(0.05), color = "black") + 
+  labs(x = "Significant MOTUs", y = parse(text = glue("Log[2]*-fold~change")), title = "B.",
+  subtitle = "Contrast B to A; statistically significant (p < 0.05) taxa shown",
+         fill = "Direction of change") +
+  coord_flip() + scale_x_discrete(limits = rev) +
+  scale_fill_manual(values = c("#26547c", "#CC79A7")) + theme_bw() +
+  facet_wrap(~diet_item, scales = "free_y") +
+  geom_hline(yintercept = 0, color = "black", linewidth = 1.5) -> plotB
+
+# plotA / plotB
+
+ancom.out %>%
+  mutate(MOTU = taxon,
+         lfc = lfc_clusterB,
+         se = se_clusterB) %>%
+  left_join(., (ancom.df %>% distinct(MOTU, diet_item)), by = "MOTU") %>%
+  group_by(diet_item) %>% mutate(lfc = mean(lfc), se = mean(se)) %>%
+  mutate(direct = ifelse(lfc > 0, "Increasing Abundance", "Decreasing Abundance")) %>%
+  ungroup() %>%
+  ggplot(aes(x = diet_item, y = lfc, fill = direct)) +
+  geom_bar(stat = "identity", width = 0.7, color = "black", 
+             position = position_dodge(width = 0.4)) +
+  geom_errorbar(aes(ymin = lfc - se, ymax = lfc + se), 
+                  width = 0.2, position = position_dodge(0.05), color = "black") + 
+  labs(x = "Diet Items", y = parse(text = glue("Averaged~log[2]*-fold~change")),
+  subtitle = "Contrast B to A; only statistically significant (p < 0.05) MOTUs included",
+         fill = NULL) +
+  coord_flip() + scale_x_discrete(limits = rev) +
+  scale_fill_manual(values = c("#26547c", "#CC79A7")) + theme_bw() +
+  theme(
+  legend.position = "right",
+  legend.background = element_blank(),
+  legend.box.background = element_rect(color = "black")) +
+  # facet_wrap(~diet_item, scales = "free_y") +
+  geom_hline(yintercept = 0, color = "black", linewidth = 1.5) -> plotB2
+
+## What species are considered "shared" across both clusters, then? ##
+ancom.out %>% mutate(MOTU = taxon) %>% distinct(MOTU) -> signif.spp
+signif.spp$MOTU
+ancom.df %>% filter(!MOTU %in% signif.spp$MOTU) %>% group_by(MOTU) %>%
+  summarise(RRA = sum(RRA), wPOO = sum(wPOO)) %>% arrange(desc(RRA))
+ancom.df %>% filter(MOTU %in% signif.spp$MOTU) %>% group_by(MOTU) %>%
+  summarise(RRA = sum(RRA), wPOO = sum(wPOO)) %>% arrange(desc(RRA))
+
+# Repeat with different diet item labels #
+ancom.df %>% mutate(diet_item = case_when(
+  order == "Amphipoda" ~ "Amphipods",
+  order == "Decapoda" ~ "Decapods",
+  order == "Euphausiacea" ~ "Euphausiids",
+  order == "Isopoda" ~ "Isopods",
+  order == "Mysida" ~ "Mysids",
+  TRUE ~ diet_item)) -> ancom.df2
+
+ancom.out %>%
+  mutate(MOTU = taxon,
+         lfc = lfc_clusterB,
+         se = se_clusterB) %>%
+  left_join(., (ancom.df2 %>% distinct(MOTU, diet_item)), by = "MOTU") %>%
+  filter(diet_item == "Mysids" | diet_item == "Amphipods" | diet_item == "Decapods" |
+         diet_item == "Euphausiids") %>%
+  group_by(diet_item) %>% mutate(lfc = mean(lfc), se = mean(se)) %>%
+  mutate(direct = ifelse(lfc > 0, "Increasing Abundance", "Decreasing Abundance")) %>%
+  ungroup()  %>%
+  ggplot(aes(x = diet_item, y = lfc, fill = direct)) +
+  geom_bar(stat = "identity", width = 0.7, color = "black", 
+             position = position_dodge(width = 0.4)) +
+  geom_errorbar(aes(ymin = lfc - se, ymax = lfc + se), 
+                  width = 0.2, position = position_dodge(0.05), color = "black") + 
+  labs(x = "Malacostracan Taxa", y = parse(text = glue("Averaged~log[2]*-fold~change")),
+       title = "C.", subtitle = "", fill = NULL) +
+  coord_flip() + scale_x_discrete(limits = rev) +
+  scale_fill_manual(values = c("#26547c", "#CC79A7")) + theme_bw() +
+  # scale_fill_manual(values = c("#CC79A7")) + theme_bw() +
+  theme(
+  legend.position = "none",
+  legend.background = element_blank(),
+  legend.box.background = element_rect(color = "black")) +
+  # facet_wrap(~diet_item, scales = "free_y") +
+  geom_hline(yintercept = 0, color = "black", linewidth = 1.5) -> plotC
+
+plotA / (plotB2 | plotC) -> Fig.4
+Fig.4
+
+ancom.out %>% dplyr::rename(MOTU = 1) %>%
+  left_join(., (df %>% distinct(MOTU, diet_item)), by = "MOTU") %>%
+  mutate(fold_change = 2^(lfc_clusterB) %>% signif(digits = 2)) %>%
+  mutate(percent_change = (2^(lfc_clusterB)-1)*100 %>% signif(digits = 2)) %>%
+  mutate(signif = case_when(
+  q_clusterB < 0.01 ~ "**",
+  TRUE ~ "*")) %>% 
+  mutate(MOTU = paste0(MOTU, " ", signif),
+         lfc_clusterB = paste0(signif(lfc_clusterB, digits = 2),
+                               " +/-",
+                               signif(se_clusterB, digits = 2))) %>%
+  dplyr::select(MOTU, diet_item, lfc_clusterB, fold_change, percent_change) %>%
+  arrange(diet_item, lfc_clusterB) %>%
+  dplyr::rename(
+    `Diet Item Category` = 2,
+    `Log2-Fold Change (A to B)` = 3,
+    `Log-Fold Change (A to B)` = 4,
+    `Percent Change (A to B)` = 5) -> Table3
+Table3 %>% kable() %>% kable_minimal()
+```
+
+## DIET REPORT COMPARISON
+
+```{r Prey comparison}
+read.data("gw_diet_items") -> gw.diet.review
+
+taxonomic_venn <- function(rank) {
+  venn_data <- list(
+    "Molecular" = unique(na.omit(df[[rank]])),
+    "Traditional" =
+      unique(na.omit(gw.diet.review[[rank]]))
+  )
+  ggvenn(
+    venn_data,
+    fill_color = c("#26547c", "#CC79A7"),
+    fill_alpha = 0.8,
+    stroke_color = "white",
+    stroke_size = 1.2,
+    set_name_color = "#263238",
+    set_name_size = 3.5,
+    text_color = "#263238",
+    text_size = 3.5) +
+    theme_void() +
+    theme(
+      plot.margin = margin(20, 30, 20, 30)
+    )
+}
+
+taxonomic_venn(rank = "phylum") + labs(title = "A", subtitle = "Phylum") -> A
+taxonomic_venn(rank = "class") + labs(title = "B", subtitle = "Class") -> B
+taxonomic_venn(rank = "order") + labs(title = "C", subtitle = "Order") -> C
+taxonomic_venn(rank = "family") + labs(title = "D", subtitle = "Family") -> D
+
+(A | B) / (C | D) -> venn.richness
+
+df %>% distinct(MOTU, phylum, class, order, family) %>%
+  mutate(reference = "Nye et al. (this study)") %>%
+  dplyr::rename(taxon = MOTU) -> x
+gw.diet.review %>% distinct(taxon, phylum, class, order, family, reference) -> y
+full_join(x, y) %>% group_by(reference, phylum) %>% summarise(S = n_distinct(family)) %>%
+  ungroup() %>% filter(!is.na(phylum)) %>%
+  mutate(reference = factor(reference, levels = c(
+    "Nerini (1984)", "Weitkamp et al. (1992)", "Darling et al. (2006)",
+    "Nye et al. (this study)"))) %>%
+  ggplot(aes(x = phylum, y = S, fill = reference)) +
+  coord_flip() + scale_x_discrete(limits = rev) +
+  geom_bar(stat = "identity", width = 0.7, color = "black", position = "stack") +
+  labs(title = "E", x = "Phylum", y = "Family-level Richness (S)", fill = "") + theme_bw() +
+  theme(legend.position = "bottom") +
+  scale_fill_manual(
+    values = c("#E69F00", "#1B9E77", "#CC79A7", "#006299")) -> E
+
+venn.richness / E -> Fig.5 # Will need to slap this together in Illustrator or something
+```
+
+```{r Export working dataset for Dryad}
+df %>% dplyr::select(sample, MOTU, RA, RRA, wPOO,
+                     MOTU_level, kingdom:species,
+                     subject, date, year_month,
+                     lat, long, field_site) -> PCFG_dDNA_working_dataset
+```
+
+## End
+
+```{r}
+gommage()
+```
